@@ -138,7 +138,7 @@ const CONN = [
 let selIdx = null, curCourse = null, poseIdx = 0;
 let timerIv = null, autoIv = null, remaining = 0, totalSec = 0;
 let hasCamera = false, stream = null, isAnalyzing = false;
-let mpPose = null, rafId = null;
+let mpPose = null, rafId = null, mpRunning = false;
 let muted = false, audioCtx = null;
 
 // ── 오디오 ──
@@ -232,12 +232,19 @@ function initMP() {
   mpPose = new Pose({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}` });
   mpPose.setOptions({ modelComplexity:1, smoothLandmarks:true, minDetectionConfidence:0.5, minTrackingConfidence:0.5 });
   mpPose.onResults(onResults);
+  mpRunning = true;
   const v = document.getElementById('video');
   (async function loop() {
-    if (!mpPose || !hasCamera) return;
+    if (!mpPose || !hasCamera || !mpRunning) return;
     await mpPose.send({ image: v });
     rafId = requestAnimationFrame(loop);
   })();
+}
+
+function stopMP() {
+  mpRunning = false;
+  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  mpPose = null;
 }
 
 // ── 각도 계산 ──
@@ -290,6 +297,7 @@ function onResults(results) {
   if (!results.poseLandmarks) return;
 
   const lm = results.poseLandmarks;
+  // [BUG FIX] poseIdx를 실제 현재 값으로 참조
   const poseId = curCourse ? curCourse.poses[poseIdx].id : 'tadasana';
   const jSt = checkJoints(lm, poseId);
 
@@ -320,10 +328,10 @@ function onResults(results) {
   const tot  = vals.filter(v => v!=='na').length;
   const score = tot > 0 ? Math.round(okC/tot*100) : null;
   const badge = document.getElementById('score-badge');
-  if      (score === null) { badge.textContent='감지 중...';             badge.className='score-badge bg-wait'; }
+  if      (score === null) { badge.textContent='감지 중...';                 badge.className='score-badge bg-wait'; }
   else if (score >= 75)    { badge.textContent=`✓ ${score}% 잘하고 있어요!`; badge.className='score-badge bg-good'; }
-  else if (score >= 45)    { badge.textContent=`${score}% 조금 더!`;     badge.className='score-badge bg-ok'; }
-  else                     { badge.textContent=`${score}% 자세 수정 필요`; badge.className='score-badge bg-bad'; }
+  else if (score >= 45)    { badge.textContent=`${score}% 조금 더!`;         badge.className='score-badge bg-ok'; }
+  else                     { badge.textContent=`${score}% 자세 수정 필요`;   badge.className='score-badge bg-bad'; }
 
   // 관절 칩
   const chips = Object.entries(jSt).map(([n,s]) =>
@@ -339,7 +347,9 @@ function onResults(results) {
 function drawRef(poseId) {
   const canvas = document.getElementById('ref-canvas');
   const side   = document.getElementById('ref-side');
-  const W = side.offsetWidth || 240, H = side.offsetHeight || 380;
+  // [BUG FIX] 항상 현재 실제 크기로 캔버스 리사이즈
+  const W = side.clientWidth  || 240;
+  const H = side.clientHeight || 380;
   canvas.width = W; canvas.height = H;
   const ctx = canvas.getContext('2d');
   const pose = REF[poseId], pts = pose.pts;
@@ -416,12 +426,19 @@ function startSession() {
 
   showCountdown(d.name, () => {
     loadPose(0);
-    if (hasCamera) autoIv = setInterval(() => { if (!isAnalyzing) snapAndAnalyze(); }, 28000);
+    // [BUG FIX] autoIv는 loadPose 내부에서 관리
   });
 }
 
 function loadPose(idx) {
   clearInterval(timerIv);
+  // [BUG FIX] autoIv를 자세 전환마다 리셋하여 중복 방지
+  clearInterval(autoIv);
+  autoIv = null;
+
+  // [BUG FIX] poseIdx를 loadPose 시점에 즉시 업데이트
+  poseIdx = idx;
+
   const p = curCourse.poses[idx], d = REF[p.id];
   totalSec = p.sec; remaining = p.sec;
 
@@ -435,9 +452,15 @@ function loadPose(idx) {
   document.getElementById('joint-row').innerHTML  = '<span class="jf-lbl">관절 체크</span><span class="chip chip-na">감지 대기 중</span>';
   document.getElementById('score-badge').textContent = '감지 중...';
   document.getElementById('score-badge').className   = 'score-badge bg-wait';
+  isAnalyzing = false; // [BUG FIX] 자세 전환 시 분석 잠금 해제
   updateTimer();
   setTimeout(() => drawRef(p.id), 80);
   setTimeout(() => speak(d.tts), 300);
+
+  // [BUG FIX] 카메라가 있을 때만, 자세별로 새로 autoIv 설정
+  if (hasCamera) {
+    autoIv = setInterval(() => { if (!isAnalyzing) snapAndAnalyze(); }, 28000);
+  }
 
   let warnedFive = false;
   timerIv = setInterval(() => {
@@ -455,6 +478,8 @@ function loadPose(idx) {
 
     if (remaining <= 0) {
       clearInterval(timerIv);
+      clearInterval(autoIv);
+      autoIv = null;
       playDing();
       if (idx+1 < curCourse.poses.length) {
         const nextName = REF[curCourse.poses[idx+1].id].name;
@@ -475,16 +500,21 @@ function updateTimer() {
 }
 
 function stopSession() {
-  clearInterval(timerIv); clearInterval(autoIv);
-  if (rafId) cancelAnimationFrame(rafId);
+  clearInterval(timerIv);
+  clearInterval(autoIv);
+  autoIv = null;
+  stopMP();
   window.speechSynthesis?.cancel();
   if (stream) stream.getTracks().forEach(t => t.stop());
-  stream = null; hasCamera = false; mpPose = null;
+  stream = null; hasCamera = false;
   goHome();
 }
 
 function finishSession() {
-  clearInterval(timerIv); clearInterval(autoIv);
+  clearInterval(timerIv);
+  clearInterval(autoIv);
+  autoIv = null;
+  stopMP();
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = null;
   playDone();
@@ -513,6 +543,7 @@ async function snapAndAnalyze() {
   c.width = v.videoWidth; c.height = v.videoHeight;
   c.getContext('2d').drawImage(v, 0, 0);
   const b64 = c.toDataURL('image/jpeg', 0.72).split(',')[1];
+  // [BUG FIX] 현재 poseIdx의 자세 이름으로 분석 (전역 poseIdx 사용)
   const pName = REF[curCourse.poses[poseIdx].id].name;
 
   document.getElementById('fb-txt').innerHTML =
@@ -542,6 +573,18 @@ async function snapAndAnalyze() {
 }
 
 function manualAnalyze() { snapAndAnalyze(); }
+
+// ── 창 크기 변경 시 정답 스켈레톤 리드로우 ──
+// [BUG FIX] 리사이즈 이벤트로 캔버스 크기 자동 갱신
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    if (curCourse && poseIdx !== null) {
+      drawRef(curCourse.poses[poseIdx].id);
+    }
+  }, 150);
+});
 
 // ── 초기화 ──
 show('screen-home');
